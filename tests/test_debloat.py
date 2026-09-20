@@ -687,5 +687,70 @@ class CatalogStatsTest(unittest.TestCase):
         self.assertIn("cmd-space", it.comment.lower())
 
 
+class MacosGateTest(unittest.TestCase):
+    def setUp(self):
+        self.debloat = load_debloat()
+
+    def test_gte_hides_keepalive_on_tahoe(self):
+        self.assertTrue(self.debloat.macos_matches(">=27", 27))
+        self.assertFalse(self.debloat.macos_matches(">=27", 26))
+        self.assertTrue(self.debloat.macos_matches("macos>=27", 27))
+
+    def test_section_header_keeps_balanced_and_macos_tags(self):
+        src = """\
+# === Spotlight KeepAlive [macos>=27] ===
+com.apple.metadata.mds                        # server
+# === Siri / voice [balanced] ===
+com.apple.assistantd                          # siri
+"""
+        secs = self.debloat.parse_labels(src)
+        self.assertEqual(secs[0].macos, ">=27")
+        self.assertEqual(secs[0].preset, "")
+        self.assertEqual(secs[1].preset, "balanced")
+        self.assertEqual(secs[1].macos, "")
+
+    def test_drop_keepalive_section_on_26(self):
+        src = """\
+# === Spotlight KeepAlive [macos>=27] ===
+com.apple.metadata.mds                        # server
+com.apple.corespotlightd                      # cs
+# === Siri / voice [balanced] ===
+com.apple.assistantd                          # siri
+"""
+        secs = self.debloat.parse_labels(src)
+        skipped = self.debloat.drop_wrong_macos(secs, major=26)
+        self.assertEqual(skipped, ["com.apple.metadata.mds", "com.apple.corespotlightd"])
+        self.assertEqual([s.title for s in secs], ["Siri / voice"])
+
+    def test_keep_keepalive_section_on_27(self):
+        src = """\
+# === Spotlight KeepAlive [macos>=27] ===
+com.apple.metadata.mds                        # server
+"""
+        secs = self.debloat.parse_labels(src)
+        skipped = self.debloat.drop_wrong_macos(secs, major=27)
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(secs[0].items), 1)
+
+    def test_catalog_gates_keepalive_not_apple_intelligence(self):
+        """KeepAlive mds is 27-only; the AI labels next to it stay in balanced."""
+        secs = self.debloat.parse_labels(self.debloat.EMBEDDED_LABELS)
+        gated = [s for s in secs if s.macos == ">=27"]
+        self.assertEqual(len(gated), 1)
+        ka = [it.label for it in gated[0].items]
+        self.assertIn("com.apple.metadata.mds", ka)
+        self.assertIn("com.apple.corespotlightd", ka)
+        self.assertNotIn("com.apple.callintelligenced", ka)
+        self.assertEqual(len(ka), 11)
+        speech = [it.label for s in secs if "Speech" in s.title for it in s.items]
+        self.assertIn("com.apple.speech.speechsynthesisd.arm64", speech)
+        self.assertIn("com.apple.speech.speechsynthesisd.x86_64", speech)
+        skipped = self.debloat.drop_wrong_macos(
+            self.debloat.parse_labels(self.debloat.EMBEDDED_LABELS), major=26)
+        self.assertIn("com.apple.metadata.mds", skipped)
+        self.assertNotIn("com.apple.callintelligenced", skipped)
+        self.assertNotIn("com.apple.speech.speechsynthesisd.x86_64", skipped)
+
+
 if __name__ == "__main__":
     unittest.main()

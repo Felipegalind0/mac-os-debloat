@@ -156,7 +156,8 @@ com.apple.dataaccess.dataaccessd              # Exchange/CardDAV/CalDAV sync
 com.apple.email.maild                         # Mail daemon
 
 # === Speech / dictation [balanced] ===
-com.apple.speech.speechsynthesisd.arm64       # text-to-speech
+com.apple.speech.speechsynthesisd.arm64       # text-to-speech (native Apple Silicon)
+com.apple.speech.speechsynthesisd.x86_64      # text-to-speech (Intel / Rosetta)
 com.apple.speech.speechdatainstallerd         # voice data installer
 com.apple.speechmaintenanced                  # on-device speech model maintenance
 
@@ -225,6 +226,22 @@ com.apple.intelligenceflowd                   # AI flow daemon
 com.apple.intelligencetasksd                  # AI tasks daemon
 com.apple.synapse.contentlinkingd             # Notes / Safari content links (backlinks)
 com.apple.LinkedNotesUIService                # Notes backlink indicator UI (~26 MB)
+
+# === Spotlight KeepAlive daemons (mdutil -d leaves these resident) [macos>=27] ===
+# Not in telemetry/balanced: on Tahoe 26, launchctl on corespotlightd broke
+# typed Cmd-Space. On Golden Gate 27, app launch uses Launch Services without
+# these, and mds KeepAlive is real RAM after the Spotlight row is off.
+com.apple.metadata.mds                        # Spotlight server (KeepAlive)
+com.apple.metadata.mds.index                  # Spotlight index helper
+com.apple.metadata.mds.scan                   # Spotlight scan helper
+com.apple.msrpc.mdssvc                        # Spotlight SMB/network metadata
+com.apple.Spotlight                           # Spotlight.app LaunchAgent
+com.apple.corespotlightd                      # CoreSpotlight daemon
+com.apple.corespotlightservice                # CoreSpotlight service
+com.apple.managedcorespotlightd               # managed CoreSpotlight
+com.apple.metadata.mdbulkimport               # Spotlight ingest worker
+com.apple.metadata.mdflagwriter               # Spotlight flag writer
+com.apple.metadata.mdwrite                    # Spotlight metadata writer
 
 # === Apple Music / iTunes / Media streaming ===
 com.apple.itunescloudd                        # Apple Music / iTunes Match cloud
@@ -366,6 +383,7 @@ com.apple.metrickitd                          # MetricKit (app metrics to Apple)
 com.apple.osanalytics.osanalyticshelper       # OS analytics helper
 com.apple.spindump_agent                      # spindump agent (process hangs)
 com.apple.metadata.mds.spindump               # Spotlight spindump diagnostic
+com.apple.diagnosticextensions.osx.spotlight.helper  # Spotlight diagnostic extension
 com.apple.audioanalyticsd                     # audio analytics
 com.apple.inputanalyticsd                     # input analytics (typing/touch)
 com.apple.ecosystemanalyticsd                 # ecosystem analytics
@@ -420,8 +438,10 @@ com.apple.watchlistd                          # Apple TV+ watchlist
 com.apple.sociallayerd                        # Game Center social layer
 com.apple.wifianalyticsd                      # WiFi telemetry
 
-# === T2 / bridgeOS (Apple Silicon doesn't use bridgeOS) ===
-com.apple.bridgeOSUpdateProxy                 # bridgeOS update proxy (T2 Intel only)
+# === T2 / bridgeOS ===
+# Same labels on T2 Intel and Apple Silicon. Disabling them breaks the
+# macOS Update install step on both (upstream issue #7). Not in balanced.
+com.apple.bridgeOSUpdateProxy                 # firmware/update proxy (T2 and Apple Silicon)
 com.apple.bosreporter                         # bridgeOS install reporting
 com.apple.boswatcher                          # BoardOS accessory watcher
 
@@ -503,7 +523,41 @@ class Item:
 class Section:
     title: str
     preset: str = ""
+    macos: str = ""
     items: list[Item] = field(default_factory=list)
+
+
+def macos_matches(spec: str, major: int | None) -> bool:
+    """Whether this macOS major version satisfies a catalog gate like '>=27'."""
+    if not spec or major is None:
+        return True
+    s = spec[5:] if spec.startswith("macos") else spec
+    m = re.match(r"^(>=|<=|==|>|<)(\d+)$", s)
+    if not m:
+        return True
+    op, n = m.group(1), int(m.group(2))
+    return {">=": major >= n, "<=": major <= n, "==": major == n,
+            ">": major > n, "<": major < n}[op]
+
+
+def parse_section_header(raw_title: str) -> Section:
+    """Trailing [balanced] / [macos>=27] tags; remainder is the section title."""
+    preset = ""
+    macos = ""
+    title = raw_title
+    while True:
+        tag = re.search(r"\s*\[([^\]]+)\]\s*$", title)
+        if not tag:
+            break
+        token = tag.group(1)
+        title = title[:tag.start()].rstrip()
+        if token in BUILTIN_PRESETS:
+            preset = token
+        elif token.startswith("macos"):
+            macos = token[len("macos"):]
+        elif re.match(r"^(>=|<=|==|>|<)\d+$", token):
+            macos = token
+    return Section(title=title, preset=preset, macos=macos)
 
 
 def parse_labels(source: Path | str) -> list[Section]:
@@ -518,11 +572,7 @@ def parse_labels(source: Path | str) -> list[Section]:
         if m:
             if current.items:
                 sections.append(current)
-            title = m.group(1)
-            tag = re.search(r"\s*\[(\w+)\]$", title)
-            tagged = tag is not None and tag.group(1) in BUILTIN_PRESETS
-            current = Section(title=title[:tag.start()] if tagged else title,
-                              preset=tag.group(1) if tagged else "")
+            current = parse_section_header(m.group(1))
             continue
         if line.lstrip().startswith("#"):
             continue
@@ -615,7 +665,7 @@ DOC_COUNT_SECTIONS: dict[str, tuple[str, ...]] = {
         "Apple ID / Apple Pay / SSO",
         "App Store full kill (re-enable when needed)",
         "Apple FairPlay DRM (no DRM-protected Apple content)",
-        "T2 / bridgeOS (Apple Silicon doesn't use bridgeOS)",
+        "T2 / bridgeOS",
         "Apple ID auth (kill — re-enable when needed for App Store)",
     ),
 }
@@ -762,6 +812,22 @@ def domain_state(domain: str) -> tuple[dict[str, int], set[str]]:
             if entry:
                 disabled.add(entry.group(1))
     return registered, disabled
+
+
+def drop_wrong_macos(sections: list[Section],
+                     major: int | None = None) -> list[str]:
+    """Drop sections gated to another macOS major (e.g. [macos>=27] on 26)."""
+    if major is None:
+        major = macos_major()
+    skipped: list[str] = []
+    keep_secs: list[Section] = []
+    for sec in sections:
+        if sec.macos and not macos_matches(sec.macos, major):
+            skipped.extend(it.label for it in sec.items)
+            continue
+        keep_secs.append(sec)
+    sections[:] = keep_secs
+    return skipped
 
 
 def drop_absent_labels(sections: list[Section]) -> list[str]:
@@ -1418,17 +1484,25 @@ def cmd_status(sections: list[Section], as_json: bool) -> int:
     return 0
 
 
-def cmd_audit(sections: list[Section], absent: list[str]) -> int:
+def cmd_audit(sections: list[Section], absent: list[str],
+              version_skip: list[str] | None = None) -> int:
     stats = catalog_stats()
     present = sum(len(sec.items) for sec in sections)
+    major = macos_major()
     print(f"catalog: {stats.total} labels in {stats.sections} sections")
-    print(f"{present} labels present on this macOS build.")
+    print(f"{present} labels present on this macOS build"
+          f"{f' ({major}.x)' if major is not None else ''}.")
+    if version_skip:
+        print(f"\n{len(version_skip)} embedded labels gated off this macOS "
+              f"(see [macos…] on the section):")
+        for label in version_skip:
+            print(f"  {label}")
     if absent:
         print(f"\n{len(absent)} embedded labels NOT present on this build (skipped):")
         for label in absent:
             print(f"  {label}")
-    else:
-        print("all embedded labels exist on this build.")
+    if not absent and not version_skip:
+        print("all embedded labels apply to this build.")
     return 0
 
 
@@ -1454,7 +1528,7 @@ def cmd_restore(sections: list[Section]) -> int:
     return code
 
 
-def load_sections() -> tuple[list[Section], str, list[str]]:
+def load_sections() -> tuple[list[Section], str, list[str], list[str]]:
     sections = parse_labels(EMBEDDED_LABELS)
     stats = catalog_stats(sections)
     note = (f"{stats.total} embedded labels in {stats.sections} sections "
@@ -1474,8 +1548,9 @@ def load_sections() -> tuple[list[Section], str, list[str]]:
                 sections.append(sec)
                 added += len(sec.items)
         note += f" + {added} from {USER_LABELS_FILE}"
+    version_skip = drop_wrong_macos(sections)
     absent = drop_absent_labels(sections)
-    return sections, note, absent
+    return sections, note, absent, version_skip
 
 
 def format_labels(sections: list[Section]) -> str:
@@ -1525,7 +1600,7 @@ def cmd_preset(sections: list[Section], name: str, dry_run: bool) -> int:
     return run_apply(sections, dry_run)
 
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 
 def help_text() -> str:
@@ -1587,12 +1662,12 @@ def main() -> int:
         return 0
 
     major = macos_major()
-    if major is not None and major != 26:
-        print(f"warning: labels curated for macOS Tahoe (26.x); this is {major}.x — "
-              f"some may not apply. Run `debloat --audit` to see what's skipped.",
+    if major is not None and major not in (26, 27):
+        print(f"warning: catalog has gates for macOS 26 and 27; this is {major}.x — "
+              f"run `debloat --audit`.",
               file=sys.stderr)
 
-    sections, source_note, absent = load_sections()
+    sections, source_note, absent, version_skip = load_sections()
     if not sections:
         print("no labels parsed", file=sys.stderr)
         return 1
@@ -1610,7 +1685,7 @@ def main() -> int:
         preset_name = argv[i + 1]
 
     if "--audit" in argv:
-        return cmd_audit(sections, absent)
+        return cmd_audit(sections, absent, version_skip)
     if "--status" in argv:
         return cmd_status(sections, as_json)
     if "--list" in argv:
@@ -1647,6 +1722,9 @@ def main() -> int:
     print(source_note)
     if absent:
         print(f"skipped {len(absent)} labels not present on this macOS build "
+              f"(see `debloat --audit`)")
+    if version_skip:
+        print(f"skipped {len(version_skip)} labels gated to another macOS "
               f"(see `debloat --audit`)")
     if not reopen_tty_stdin():
         print("the interactive TUI needs a terminal on stdin, but none is "
