@@ -50,7 +50,15 @@ EMBEDDED_LABELS = """\
 # Format: label  # comment (what breaks if disabled)
 # Lines starting with `# ===` are section headers.
 
+# === Spotlight / app launcher ===
+# On 27, Siri AI.app (campo) hosts Cmd-Space and the four-finger Apps pinch.
+# That is how you launch apps — not an AI extra. Not in balanced; --disable-all
+# still reaches it if you have another launcher.
+com.apple.campo                               # Cmd-Space + four-finger Apps pinch (Spotlight UI). Leave on to launch apps the usual way.
+
 # === Siri / voice assistant [balanced] ===
+com.apple.siriappintentsd                     # Siri App Intents orchestrator
+com.apple.assistant_service                   # Siri execution / flow XPC
 com.apple.assistantd                          # Siri core
 com.apple.Siri.agent                          # Siri agent
 com.apple.SiriTTSTrainingAgent                # Siri voice training
@@ -74,6 +82,9 @@ com.apple.modelmanagerd                       # AI model manager / downloads
 com.apple.naturallanguaged                    # NaturalLanguage framework daemon
 com.apple.textunderstandingd                  # text understanding AI
 com.apple.triald                              # Siri experiments (known CPU hog)
+com.apple.triald.system                       # Siri experiments (system)
+com.apple.visualintelligenced                 # Visual Intelligence (screenshot / camera AI)
+com.apple.GenerativeFunctions.agentstored     # Apple Intelligence agent session store
 com.apple.contextstored                       # context store (KNOWN >30GB MEMORY LEAK in Tahoe)
 
 # === Telemetry / analytics [telemetry] ===
@@ -81,6 +92,7 @@ com.apple.analyticsd                          # Apple diagnostics submission
 com.apple.tipsd                               # Tips app notifications
 
 # === AirDrop / Continuity (no iPhone) [balanced] ===
+com.apple.sharingd                            # AirDrop / Handoff / share sheet (~60 MB resident)
 com.apple.rapportd                            # device proximity / Continuity discovery
 
 # === Diagnostics / crash reports [telemetry] ===
@@ -117,6 +129,7 @@ com.apple.followupd                           # Apple ID setup nags
 
 # === Misc [balanced] ===
 com.apple.helpd                               # Help viewer indexer
+com.apple.ndoagent                            # AppleCare / new-device outreach nags
 
 # === iMessage / FaceTime / phone relay (no iPhone) [balanced] ===
 com.apple.imagent                             # iMessage agent
@@ -140,10 +153,12 @@ com.apple.contactsd                           # Contacts sync
 com.apple.calaccessd                          # Calendar backend
 com.apple.remindd                             # Reminders
 com.apple.dataaccess.dataaccessd              # Exchange/CardDAV/CalDAV sync
+com.apple.email.maild                         # Mail daemon
 
 # === Speech / dictation [balanced] ===
 com.apple.speech.speechsynthesisd.arm64       # text-to-speech
 com.apple.speech.speechdatainstallerd         # voice data installer
+com.apple.speechmaintenanced                  # on-device speech model maintenance
 
 # === Wallpaper / thumbnails [balanced] ===
 com.apple.quicklook.ThumbnailsAgent           # QuickLook thumbnails in Finder
@@ -160,6 +175,7 @@ com.apple.liveactivitiesd                     # Live Activities widgets
 # === iCloud (no iCloud use) ===
 com.apple.cloudd                              # iCloud sync core
 com.apple.cloudphotod                         # iCloud Photos sync
+com.apple.icloudwebd                          # iCloud.com / iCloud on the web
 
 # === Location/prediction extras (Find My still intact) [balanced] ===
 com.apple.routined                            # significant locations / location-aware reminders
@@ -173,6 +189,7 @@ com.apple.backupd-helper                      # Time Machine scheduling helper
 # === Focus / DND / Screen Time ===
 com.apple.donotdisturbd                       # Focus modes / Do Not Disturb
 com.apple.ScreenTimeAgent                     # Screen Time
+com.apple.ScreenTimeSettingsAgent             # Screen Time settings UI agent
 com.apple.ManagedSettingsAgent                # Screen Time app limits
 com.apple.UsageTrackingAgent                  # device usage tracking (Screen Time data)
 com.apple.StatusKitAgent                      # share Focus status (iMessage)
@@ -206,6 +223,8 @@ com.apple.spotlightknowledged.updater         # CoreSpotlight updater
 com.apple.callintelligenced                   # AI call analysis (call summaries)
 com.apple.intelligenceflowd                   # AI flow daemon
 com.apple.intelligencetasksd                  # AI tasks daemon
+com.apple.synapse.contentlinkingd             # Notes / Safari content links (backlinks)
+com.apple.LinkedNotesUIService                # Notes backlink indicator UI (~26 MB)
 
 # === Apple Music / iTunes / Media streaming ===
 com.apple.itunescloudd                        # Apple Music / iTunes Match cloud
@@ -1534,7 +1553,7 @@ Usage:
 Presets:
   telemetry   {stats.telemetry} labels — analytics, crash reports, Apple ads, Biome, beta enrollment
   balanced    {stats.balanced} labels — telemetry + Siri, Apple Intelligence, iMessage/Continuity, Family
-  disable-all {stats.total} labels — every catalog entry, including Apple ID auth, App Store, bridgeOS
+  disable-all {stats.total} labels — every catalog entry, including Apple ID auth, App Store, bridgeOS, and campo (Cmd-Space)
   custom      {PRESETS_DIR}/NAME.txt
 
   The TUI lists telemetry, balanced, disable all and enable all as menu rows
@@ -1543,8 +1562,9 @@ Presets:
   A preset only disables its own labels; everything else is left as-is, and
   nothing is ever re-enabled. Counts above are before pruning labels absent
   from your macOS build. --disable-all and --enable-all ignore --preset and
-  take every label, including Apple ID auth, App Store and bridgeOS — that
-  breaks iCloud login, App Store purchases and macOS Update installs.
+  take every label, including Apple ID auth, App Store, bridgeOS, and
+  com.apple.campo — that breaks iCloud login, App Store purchases, macOS
+  Update installs, and on macOS 27 Cmd-Space / the four-finger Apps pinch.
 
 Your own labels:
   {USER_LABELS_FILE} is appended to the built-in list.
@@ -1613,9 +1633,10 @@ def main() -> int:
         want_enabled = "--enable-all" in argv
         if not want_enabled:
             print("--disable-all takes every label, including Apple ID auth, App "
-                  "Store and bridgeOS: iCloud login, App Store purchases and "
-                  "macOS Update installs will break. `--preset balanced` keeps "
-                  "them.")
+                  "Store, bridgeOS, and com.apple.campo: iCloud login, App Store "
+                  "purchases, macOS Update installs, and on macOS 27 Cmd-Space / "
+                  "the four-finger Apps pinch will break. `--preset balanced` "
+                  "keeps them.")
         for sec in sections:
             for it in sec.items:
                 it.selected = want_enabled

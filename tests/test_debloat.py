@@ -667,6 +667,25 @@ class CatalogStatsTest(unittest.TestCase):
                       (tmp / "package.json").read_text())
         self.assertEqual(self.debloat.sync_docs(tmp, check=True), [])
 
+    def test_campo_is_app_launcher_not_an_ai_preset(self):
+        """campo hosts Cmd-Space on 27. Keep it listed so you can still turn
+        it off, but it is how you launch apps — not Siri — and balanced
+        must not take it."""
+        found = None
+        for sec in self.debloat.parse_labels(self.debloat.EMBEDDED_LABELS):
+            for it in sec.items:
+                if it.label == "com.apple.campo":
+                    found = (sec, it)
+                    break
+        self.assertIsNotNone(found, "com.apple.campo must stay in the catalog")
+        sec, it = found
+        self.assertEqual(sec.preset, "")
+        title = sec.title.lower()
+        self.assertNotIn("siri", title)
+        self.assertNotIn("intelligence", title)
+        self.assertNotRegex(title, r"\bai\b")
+        self.assertIn("cmd-space", it.comment.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
