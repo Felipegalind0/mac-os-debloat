@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -751,6 +752,96 @@ com.apple.metadata.mds                        # server
         self.assertIn("com.apple.metadata.mds", skipped)
         self.assertNotIn("com.apple.callintelligenced", skipped)
         self.assertNotIn("com.apple.speech.speechsynthesisd.x86_64", skipped)
+        self.assertNotIn("com.apple.speech.speechsynthesisd.x86_64", skipped)
+
+
+class SipAndModelsTest(unittest.TestCase):
+    def setUp(self):
+        self.debloat = load_debloat()
+
+    def test_sip_enabled_parses_csrutil(self):
+        self.assertTrue(self.debloat.sip_enabled(
+            "System Integrity Protection status: enabled.\n"))
+        self.assertFalse(self.debloat.sip_enabled(
+            "System Integrity Protection status: disabled.\n"))
+        self.assertIsNone(self.debloat.sip_enabled("garbage"))
+
+    def test_model_dirs_dedupe_same_inode(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            a = tmp / "a"
+            b = tmp / "b"
+            a.mkdir()
+            (a / "com_apple_MobileAsset_UAF_FM_Visual").mkdir()
+            os.symlink(a, b)
+            found = self.debloat.existing_ai_model_dirs((a, b))
+            self.assertEqual(len(found), 1)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_persist_matcher_only_fm_models(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            p = tmp / "persisted" / "AutoAssetScheduler"
+            p.mkdir(parents=True)
+            keep = p / "AutoAssetScheduler_Entry_com.apple.MobileAsset.UAF.LinguisticData.state"
+            drop = p / "AutoAssetScheduler_Entry_com.apple.MobileAsset.UAF.FM.Visual.state"
+            keep.write_text("x")
+            drop.write_text("x")
+            found = {f.name for f in self.debloat.ai_persist_files(tmp)}
+            self.assertEqual(found, {drop.name})
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_catalog_lists_mobileassetd_outside_balanced(self):
+        secs = self.debloat.parse_labels(self.debloat.EMBEDDED_LABELS)
+        labels = {it.label for s in secs for it in s.items}
+        self.assertIn("com.apple.mobileassetd", labels)
+        self.assertIn("com.apple.assetsubscriptiond", labels)
+        balanced = {it.label for s in self.debloat.resolve_preset(secs, "balanced")
+                    for it in s.items}
+        self.assertNotIn("com.apple.mobileassetd", balanced)
+
+    def test_summarize_rm_errors_counts_kinds(self):
+        text = "\n".join([
+            "rm: a/metadata.json: Read-only file system",
+            "rm: a/.AssetData: Resource busy",
+            "rm: b/metadata.json: Read-only file system",
+            "rm: a: Directory not empty",
+        ])
+        s = self.debloat.summarize_rm_errors(text)
+        self.assertIn("read-only file system ×2", s)
+        self.assertIn("resource busy ×1", s)
+        self.assertIn("directory not empty ×1", s)
+        self.assertNotIn("metadata.json", s)
+
+    def test_data_volume_path_leaves_non_system_alone(self):
+        p = Path("/tmp/not-system")
+        self.assertEqual(self.debloat.data_volume_path(p), p)
+
+    def test_purge_disables_mobileassetd(self):
+        self.assertIn("com.apple.mobileassetd", self.debloat.AI_DOWNLOAD_LABELS)
+
+    def test_help_mentions_purge(self):
+        self.assertIn("--purge-ai-models", self.debloat.help_text())
+
+    def test_filevault_status_parses_fdesetup(self):
+        self.assertFalse(self.debloat.filevault_enabled("FileVault is Off.\n"))
+        self.assertTrue(self.debloat.filevault_enabled("FileVault is On.\n"))
+        self.assertIsNone(self.debloat.filevault_enabled("garbage"))
+
+    def test_leftover_advice_names_authenticated_root(self):
+        text = self.debloat.leftover_blocker_text(
+            sip_on=False, ar_on=True, fv_on=True, data_vol="Data")
+        self.assertIn("csrutil authenticated-root disable", text)
+        self.assertIn("FileVault must be disabled", text)
+        self.assertIn("fdesetup status", text)
+        self.assertIn("Encrypted at rest", text)
+        self.assertIn("/Volumes/Data/System/Library/AssetsV2/", text)
+        self.assertNotIn("it now disables mobileassetd first", text)
+        sip_text = self.debloat.leftover_blocker_text(
+            sip_on=True, ar_on=True, data_vol="Data")
+        self.assertIn("SIP is on", sip_text)
 
 
 if __name__ == "__main__":

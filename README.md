@@ -2,10 +2,12 @@
 
 **Debloat your Mac from the terminal. Zero dependencies. Zero install.**
 
-Interactive console util to disable 296 non-essential macOS launchd services — Siri, Apple Intelligence, telemetry, ads, and the Apple apps you don't use — plus the Spotlight file index. Frees ~1.5-2 GB of RAM on a 16 GB M4 ([how that was measured](#why)). Fully reversible. Built for macOS Tahoe 26.x and Golden Gate 27 on Apple Silicon (**tested on 27**, [#15](https://github.com/OleksandrKrupko/mac-os-debloat/issues/15)); Tahoe still supports four Intel models, which are untested. Verify with `debloat --status`, which reports what is actually in effect and how many of the services are running right now — including after a reboot ([see below](#persistence)). Counts in this README are filled by [`extras/sync-readme.py`](extras/sync-readme.py) from the catalog — do not edit the numbers by hand.
+Interactive console util to disable 298 non-essential macOS launchd services — Siri, Apple Intelligence, telemetry, ads, and the Apple apps you don't use — plus the Spotlight file index. Frees ~1.5-2 GB of RAM on a 16 GB M4 ([how that was measured](#why)). Fully reversible. Built for macOS Tahoe 26.x and Golden Gate 27 on Apple Silicon (**tested on 27**, [#15](https://github.com/OleksandrKrupko/mac-os-debloat/issues/15)); Tahoe still supports four Intel models, which are untested. Verify with `debloat --status`, which reports what is actually in effect and how many of the services are running right now — including after a reboot ([see below](#persistence)). Counts in this README are filled by [`extras/sync-readme.py`](extras/sync-readme.py) from the catalog — do not edit the numbers by hand.
 **The desktop is not touched.** Nothing here disables WindowServer, Finder, Dock, Control Center, audio, networking, Wi-Fi, security or your own apps — those labels are not in the catalog at all, at any setting. Even `--disable-all` leaves you with a normal, fully working Mac; what it costs you is listed [below](#presets).
 
 **No SIP disable required** — works with System Integrity Protection fully on, via Apple's supported `launchctl disable`. Labels whose plists are missing on this build are skipped. Sections can also be gated with `[macos>=27]` (and `<`, `==`, …) so a disable that is safe on Golden Gate is **not** applied on Tahoe — same plist, different OS, different policy. `debloat --audit` lists both kinds of skip.
+
+If SIP is **already off**, `debloat --purge-ai-models` goes further: it opts Apple Intelligence out, disables the model-catalog / UAF / `mobileassetd` daemons, `chflags norestricted`, and deletes **writable Data** trees (Visual/Overrides and later downloads). SIP on: downloaders stop so the trees stop growing. A leftover `models on disk now:` line is a real `du` after `rm` — remaining `.asset` bundles are listed (including empty husks). **SIP off is not enough for OS-sealed GenerativeModels** (`rm` returns EROFS while `authenticated-root` is on). That needs FileVault **off** (`fdesetup status`, not Settings.app — it lags) **and** Recovery `csrutil authenticated-root disable`, then re-run. On Apple Silicon, diskutil `Encrypted at rest` is hardware AES, not FileVault. This tool still never writes sealed `/System` executables. `mobileassetd` also delivers dictionaries and trust lists; tick that TUI row back on if you still want those.
 
 ```bash
 npx -y @oleksandr_krupko/mac-os-debloat
@@ -25,7 +27,7 @@ brew install OleksandrKrupko/debloat/debloat && debloat
 
 All three methods need `python3` — preinstalled with the Xcode Command Line Tools (`xcode-select --install` if it's missing). The curl one-liner pipes the script to `python3`, so it reopens `/dev/tty` for the interactive keys; if you have no terminal attached, use the non-interactive flags below or the `npx` launcher.
 
-![mac-os-debloat TUI — preset menu on top, then the Spotlight row and 296 launchd services grouped by section, space to toggle, enter to apply](https://raw.githubusercontent.com/OleksandrKrupko/mac-os-debloat/main/screenshot.png)
+![mac-os-debloat TUI — preset menu on top, then the Spotlight row and 298 launchd services grouped by section, space to toggle, enter to apply](https://raw.githubusercontent.com/OleksandrKrupko/mac-os-debloat/main/screenshot.png)
 
 The top block is a menu: arrow onto `telemetry`, `balanced`, `disable all` or `enable all` and press `enter` to apply it right away. `disable all` disappears once everything is off, `enable all` once everything is on, so every row on offer does something.
 
@@ -45,11 +47,13 @@ debloat --audit            # list any embedded labels not present on your macOS 
 debloat --disable-all      # disable every label, no exceptions (prompts sudo)
 debloat --enable-all       # re-enable everything — the panic button
 debloat --restore          # revert to the state before your last apply
-debloat --dry-run          # with --preset/--disable-all/--enable-all: preview only
+debloat --purge-ai-models  # stop AI downloads (incl. mobileassetd); SIP off: delete trees
+debloat --purge-ai-models --yes --dry-run
+debloat --dry-run          # with --preset/--disable-all/--enable-all/--purge-ai-models: preview only
 debloat --status --json    # machine-readable status
 ```
 
-An apply is two `sudo launchctl` calls per label per domain, so `--disable-all` runs several hundred of them; it prints a `disabling 137/296 com.apple.…` line in place while it works, on the command line and in the TUI alike. Piped output gets none of that.
+An apply is two `sudo launchctl` calls per label per domain, so `--disable-all` runs several hundred of them; it prints a `disabling 137/298 com.apple.…` line in place while it works, on the command line and in the TUI alike. Piped output gets none of that.
 
 An apply prompts for your sudo password on the TUI's own bottom line — the TUI never drops back to your shell, and the progress line and the result land in the same place. `--status`, `--audit`, `--list`, and `--dry-run` need no sudo — reading launchd state is unprivileged. Every apply first snapshots your current state to `~/.mac-os-debloat/latest.json`, so `--restore` always brings you back. If anything feels off, `debloat --enable-all` turns it all back on.
 
@@ -80,14 +84,15 @@ Three rungs, safest first. A preset disables its own labels, leaves everything e
 |---|---|---|
 | `--preset telemetry` | 47 | nothing — analytics, crash reports, Apple ads, Biome, beta enrollment |
 | `--preset balanced` | 184 | Siri, Apple Intelligence, iMessage/FaceTime/Continuity, Family, News/Stocks/Weather, nags |
-| `--disable-all` | 296 | balanced, plus Safari services, Photos analysis, Mail/Calendar/Contacts, Music/TV/Books, Maps, Time Machine, Screen Time, HomeKit, printing, iCloud sync, Spotlight KeepAlive daemons — and **iCloud login, App Store purchases, macOS Update installs, and on macOS 27 Cmd-Space / the four-finger Apps pinch (`com.apple.campo`) break** |
+| `--disable-all` | 298 | balanced, plus Safari services, Photos analysis, Mail/Calendar/Contacts, Music/TV/Books, Maps, Time Machine, Screen Time, HomeKit, printing, iCloud sync, Spotlight KeepAlive daemons, MobileAsset — and **iCloud login, App Store purchases, macOS Update installs, and on macOS 27 Cmd-Space / the four-finger Apps pinch (`com.apple.campo`) break** |
 `--disable-all` is not a "console only" mode. The GUI, third-party apps, Wi-Fi, audio and Bluetooth keep working — it disables Apple's own background services, not the desktop. The Spotlight *index* is the checkbox, not a launchd row. What `--disable-all` does break are the things in bold above, because it reaches Apple ID auth, App Store commerce, the bridgeOS update path, and `com.apple.campo` (the Cmd-Space overlay on 27). Re-enable those from the TUI, or with `--restore` / `--enable-all`.
 
 Counts are before pruning: the tool drops labels that don't exist on your macOS build, so what it prints is a little lower.
 
 Neither preset touches Apple ID auth (`akd`, `appleaccountd`, `adid`, `AppSSODaemon`, `AppSSOAgent`, `identityservicesd`), App Store commerce, FairPlay or bridgeOS — 27 labels. Only `--disable-all` and your own presets can reach those.
 
-112 labels sit between `balanced` and `--disable-all` — Safari, Photos, Music/TV/Books, Maps, Time Machine, Contacts/Calendar/Mail, Game Center, HomeKit, Screen Time, iCloud sync, print, the Cmd-Space / Apps overlay (`com.apple.campo`), and Spotlight KeepAlive daemons. Which of those you want is personal, so there's no preset for it: make your own.
+114 labels sit between `balanced` and `--disable-all` — Safari, Photos, Music/TV/Books, Maps, Time Machine, Contacts/Calendar/Mail, Game Center, HomeKit, Screen Time, iCloud sync, print, the Cmd-Space / Apps overlay (`com.apple.campo`), Spotlight KeepAlive daemons, and MobileAsset (`mobileassetd`). Which of those you want is personal, so there's no preset for it: make your own.
+
 Every rung is also a row in the TUI's preset menu — arrow onto it, press `enter`. To turn something back on, use the TUI (`space` toggles an item, `enter` applies), the `enable all` menu row, `--restore`, or `--enable-all`.
 
 ### Make your own preset
@@ -116,7 +121,7 @@ com.apple.something                # what it does, what breaks
 <details>
 <summary><b>What it disables</b></summary>
 
-296 labels across 71 sections. Highlights:
+298 labels across 72 sections. Highlights:
 - Siri / voice assistant (14)
 - Apple Intelligence — Tahoe (13), incl. `contextstored` (known >30 GB memory leak) and `privatecloudcomputed`
 - More AI / Apple Intelligence (13) — CoreSpotlight semantic, call intelligence, intelligence flow / tasks
@@ -133,6 +138,7 @@ com.apple.something                # what it does, what breaks
 - App Store + Apple ID + Apple Pay + SSO
 - iCloud Drive / Keychain Circle / Notifications
 - Print (no printer), Touch Bar (M4 has none), bridgeOS (T2 and Apple Silicon; macOS Update install)
+- MobileAsset (`mobileassetd`) — on-device CDN for AI models *and* dictionaries/trust lists; not in balanced
 - Xcode / iOS dev stack (FE/BE dev, no mobile)
 - Telemetry + Apple ads + Proactive / predictive + News / Stocks / Weather
 
@@ -209,7 +215,7 @@ None of these are in the catalog, so the tool never touches them. Listed because
 - `com.apple.WindowServer`, `controlcenter`, `notificationcenterui`, `Finder`, `Dock`, `SystemUIServer` — UI dies
 - `com.apple.coreaudiod` — sound dies
 - `com.apple.accountsd`, `syspolicyd`, `securityd`, `trustd` — auth / codesign break
-- `com.apple.softwareupdated` — kills security updates
+- `com.apple.softwareupdated` — kills OS/security updates. `mobileassetd` is different (the AssetsV2 CDN); it is in the catalog, not in balanced, because it also delivers dictionaries and trust-store updates. Tick it off yourself if you want that pipe dead.
 - `com.apple.XprotectService` — kills malware scanning
 - `com.apple.CoreLocationAgent`, `searchpartyd` — Find My breaks
 
@@ -230,6 +236,31 @@ The `reclaimable RAM` line in `--status` is not a prediction of that gain: it's 
 </details>
 
 <details>
+<summary><b>Apple Intelligence models on disk</b></summary>
+
+`debloat --purge-ai-models` opts Apple Intelligence out, disables `modelcatalogd` / `ModelCatalogAgent` / `modelmanagerd` / `assetsubscriptiond` / `mobileassetd`, and with SIP already off deletes the Data-volume trees:
+
+- `/System/Library/AssetsV2/com_apple_MobileAsset_UAF_FM_GenerativeModels`
+- `/System/Library/AssetsV2/com_apple_MobileAsset_UAF_FM_Visual`
+- `/System/Library/AssetsV2/com_apple_MobileAsset_UAF_FM_Overrides`
+
+`models on disk now:` is a real `du` after `rm`. Failed `rm` is summarized (`EROFS ×N`), not dumped. Remaining `.asset` bundles are listed, including **empty husks**.
+
+Three locks, independent:
+
+| What | What it actually is | Purge |
+|---|---|---|
+| SIP | `restricted` flags, `launchctl` on system plists | Optional. Off lets `chflags` + `rm` of ordinary Data downloads (Visual/Overrides). |
+| FileVault | user-password wrap (`fdesetup status`) | Settings.app **lags**. `csrutil authenticated-root disable` refuses until FileVault is off and decrypt has finished. |
+| authenticated-root | sealed snapshot at `/` | Recovery only. This tool never writes sealed `/System` executables. Not required if leftover files are already gone. |
+
+On Apple Silicon, `diskutil` `FileVault: No (Encrypted at rest)` is hardware AES. It is **not** FileVault and stays after FileVault is off.
+
+Measured on Golden Gate 27: SIP off was not enough for ~8.5 GB of GenerativeModels (`rm` / `apfs.util -K` → EROFS). Turning FileVault off dropped those files (Data shrank ~10 GB) and left empty `.asset` directories, which `rm` then deleted **without** disabling authenticated-root. Downloaders stay disabled so the trees should not refill. Tick MobileAsset back on in the TUI if you still want dictionary/trust-store updates.
+
+</details>
+
+<details>
 <summary><b>Extras</b></summary>
 
 Scripts in [`extras/`](extras) are not part of the TUI:
@@ -237,6 +268,7 @@ Scripts in [`extras/`](extras) are not part of the TUI:
 - `sync-readme.py` — rewrite catalog counts in `README.md` and `package.json` from the label list. Run after adding or removing a label. `python3 extras/sync-readme.py --check` exits 1 if the docs are stale.
 - `disable-animations.sh` / `enable-animations.sh` — reduce motion and transparency (the Liquid Glass memory-leak workaround on Tahoe), zero Dock/window/Finder animation durations, restart Dock and Finder. `defaults write` only, no sudo, fully reversible with the enable script.
 - `disable-spotlight.sh` / `enable-spotlight.sh` — the Spotlight *index* toggle as a standalone script for setups that never open the TUI. Same `mdutil -a -d` / `-i on` + `-E` as the TUI row; disable also erases the index on every volume. These scripts do **not** `launchctl disable` KeepAlive `mds` / `corespotlightd`. That extra RAM cut is a catalog section gated `[macos>=27]` (`mdutil -d` leaves `mds` resident; killing it on Tahoe 26 broke typed Cmd-Space). `enable-spotlight.sh` only turns indexing back on; reverse KeepAlive from the TUI, `--restore`, or `--enable-all`.
+- `purge-apple-intelligence-models.sh` — wrapper for `debloat --purge-ai-models`. Disables modelcatalog/UAF/`mobileassetd`; with SIP off, deletes writable Data trees. OS-sealed leftover (EROFS) needs FileVault off (`fdesetup status`) then Recovery `csrutil authenticated-root disable`. Empty husks after decrypt are listed. Tick MobileAsset back on in the TUI for dictionary/trust-store updates.
 
 </details>
 
@@ -245,7 +277,8 @@ Scripts in [`extras/`](extras) are not part of the TUI:
 
 | Tool | Console UI | Curated list | Persistent | No SIP disable | Zero install |
 |------|-----------|--------------|------------|----------------|--------------|
-| **mac-os-debloat** | ✓ | ✓ 296 labels + Spotlight | `launchctl disable` + verified per domain ([caveat](#persistence)) | ✓ | ✓ Python stdlib || [launchtui](https://github.com/macournoyer/launchtui) | ✓ | ✗ generic | ✗ bootout only | ✓ | ✗ `cargo install` |
+| **mac-os-debloat** | ✓ | ✓ 298 labels + Spotlight | `launchctl disable` + verified per domain ([caveat](#persistence)) | ✓ | ✓ Python stdlib |
+| [launchtui](https://github.com/macournoyer/launchtui) | ✓ | ✗ generic | ✗ bootout only | ✓ | ✗ `cargo install` |
 | [Silverback-Debloater](https://github.com/Wamphyre/macOS_Silverback-Debloater) | ✗ | ✓ | ✓ | ✓ | ✗ Intel-desktop only |
 | [b0gdanw Tahoe gist](https://gist.github.com/b0gdanw/0c20c2fd5d0a7e6cff01849b57108967) | ✗ | ✓ | ✓ | ✗ needs SIP off | gist copy |
 | LaunchControl / Lingon | GUI | ✗ | ✓ | ✓ | ✗ commercial |

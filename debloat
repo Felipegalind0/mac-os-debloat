@@ -446,6 +446,16 @@ com.apple.bridgeOSUpdateProxy                 # firmware/update proxy (T2 and Ap
 com.apple.bosreporter                         # bridgeOS install reporting
 com.apple.boswatcher                          # BoardOS accessory watcher
 
+# === MobileAsset (on-device CDN) ===
+# Not in telemetry/balanced. This is the pipe that fills AssetsV2: the 20+ GB
+# Apple Intelligence models, and also dictionaries, timezone, PKI/kext-deny
+# lists, Siri voices. softwareupdated still does OS upgrades; some
+# asset-backed update pieces and accessory firmware (UARP) may stall.
+# KeepAlive + a 4-hour auto-scheduler + APS push — that is the unsolicited
+# CPU/network. Tick it off in the TUI if you want it dead.
+com.apple.mobileassetd                        # downloads every MobileAsset (AI models included)
+com.apple.assetsubscriptiond                  # UAF/Trial subscriptions that tell mobileassetd what to pull
+
 # === Print (no printer) ===
 com.apple.printtool.agent                     # print tool agent
 com.apple.printtool.daemon                    # print tool daemon
@@ -982,6 +992,11 @@ def apply_problems(result: dict) -> str:
         out.append(f"  FAILED  launchctl {cmd}: {msg}")
     for msg, count in sorted(result["bootout_failures"].items(), key=lambda kv: -kv[1]):
         out.append(f"  bootout failed on {count} label(s): {msg}")
+    sip_bootout = any("integrity protection" in m.lower() or "sip" in m.lower()
+                      for m in result["bootout_failures"])
+    if sip_bootout and sip_enabled() is not False:
+        out.append("  live processes stay until reboot; `launchctl disable` still "
+                   "holds. With SIP off, a re-apply can bootout the running jobs.")
     for key, verb in (("not_disabled", "disabled"), ("not_enabled", "enabled")):
         if result[key]:
             out.append(f"⚠ {len(result[key])} labels are NOT {verb} in every domain they "
@@ -1387,6 +1402,52 @@ def macos_major() -> int | None:
     return int(part) if part.isdigit() else None
 
 
+def sip_enabled(status_text: str | None = None) -> bool | None:
+    """True if SIP is on, False if off, None if csrutil did not say."""
+    if status_text is None:
+        r = subprocess.run(["csrutil", "status"],
+                           capture_output=True, text=True, check=False)
+        status_text = r.stdout + r.stderr
+    t = status_text.lower()
+    if "disabled" in t:
+        return False
+    if "enabled" in t:
+        return True
+    return None
+
+
+def filevault_enabled(status_text: str | None = None) -> bool | None:
+    """True if FileVault is on. Settings.app lags; trust fdesetup.
+
+    Apple Silicon `diskutil` 'Encrypted at rest' is hardware AES, not this.
+    """
+    if status_text is None:
+        r = subprocess.run(["fdesetup", "status"],
+                           capture_output=True, text=True, check=False)
+        status_text = r.stdout + r.stderr
+    t = status_text.lower()
+    if "filevault is off" in t:
+        return False
+    if "filevault is on" in t:
+        return True
+    return None
+
+
+def authenticated_root_enabled(status_text: str | None = None) -> bool | None:
+    """Sealed system volume. Off is a separate switch from SIP; we still never
+    touch /System executables."""
+    if status_text is None:
+        r = subprocess.run(["csrutil", "authenticated-root", "status"],
+                           capture_output=True, text=True, check=False)
+        status_text = r.stdout + r.stderr
+    t = status_text.lower()
+    if "disabled" in t:
+        return False
+    if "enabled" in t:
+        return True
+    return None
+
+
 def mem_free_mb() -> int | None:
     """Reclaimable RAM (free + inactive + speculative + purgeable) in MB."""
     r = subprocess.run(["vm_stat"], capture_output=True, text=True, check=False)
@@ -1402,6 +1463,405 @@ def mem_free_mb() -> int | None:
         if m:
             pages += int(m.group(1))
     return pages * page_bytes // (1024 * 1024)
+
+
+# Apple Intelligence models live in MobileAsset trees on the Data volume
+# (firmlinked at /System/Library/AssetsV2). SIP `restricted` flags block rm
+# even as root; with SIP off, chflags norestricted then rm is the extra mile.
+AI_MODEL_DIRNAMES = (
+    "com_apple_MobileAsset_UAF_FM_GenerativeModels",
+    "com_apple_MobileAsset_UAF_FM_Visual",
+    "com_apple_MobileAsset_UAF_FM_Overrides",
+)
+AI_ASSET_ROOTS = (
+    Path("/System/Library/AssetsV2"),
+    Path("/System/Volumes/Data/System/Library/AssetsV2"),
+)
+AI_PERSIST_NEEDLES = (
+    "UAF.FM.GenerativeModels",
+    "UAF.FM.Visual",
+    "UAF.FM.Overrides",
+)
+AI_DOWNLOAD_LABELS = (
+    "com.apple.modelcatalogd",
+    "com.apple.ModelCatalogAgent",
+    "com.apple.modelmanagerd",
+    "com.apple.assetsubscriptiond",
+    "com.apple.mobileassetd",  # must stop or nsurlsessiond holds .AssetData (EROFS / busy)
+)
+# Boot out for the delete only — ANE is shared (camera etc.), not a catalog disable.
+ANE_BOUT_LABELS = (
+    "com.apple.aned",
+    "com.apple.aneuserd",
+)
+
+
+def path_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    r = subprocess.run(["du", "-sk", str(path)],
+                       capture_output=True, text=True, check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return 0
+    try:
+        return int(r.stdout.split()[0]) * 1024
+    except ValueError:
+        return 0
+
+
+def existing_ai_model_dirs(roots: tuple[Path, ...] | None = None) -> list[Path]:
+    """Unique model trees (Data and /System/Library/AssetsV2 are often one inode)."""
+    seen: set[tuple[int, int]] = set()
+    out: list[Path] = []
+    for root in roots or AI_ASSET_ROOTS:
+        for name in AI_MODEL_DIRNAMES:
+            p = root / name
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            key = (st.st_dev, st.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def ai_persist_files(root: Path) -> list[Path]:
+    """AutoAsset scheduler/lock files that would re-queue FM model downloads."""
+    persisted = root / "persisted"
+    locks = root / "locks" / "com.apple.UnifiedAssetFramework"
+    found: list[Path] = []
+    for base in (persisted, locks):
+        if not base.is_dir():
+            continue
+        for p in base.rglob("*"):
+            if p.is_file() and any(n in p.name for n in AI_PERSIST_NEEDLES):
+                found.append(p)
+    return found
+
+
+def fmt_bytes(n: int) -> str:
+    if n >= 1024 ** 3:
+        return f" {n / 1024 ** 3:.1f} GB"
+    if n >= 1024 ** 2:
+        return f"{n / 1024 ** 2:.0f} MB"
+    if n >= 1024:
+        return f" {n / 1024:.0f} KB"
+    return f"{n} B"
+
+
+def opt_out_apple_intelligence() -> None:
+    subprocess.run(["defaults", "write", "com.apple.Siri", "GMSignedUp",
+                    "-bool", "false"], check=False)
+    subprocess.run(["defaults", "write",
+                    "com.apple.CloudSubscriptionFeatures.optIn",
+                    "opted_out_buddy", "-bool", "true"], check=False)
+    r = subprocess.run(
+        ["/usr/libexec/PlistBuddy", "-c", "Print :Accounts:0:AccountDSID",
+         str(Path.home() / "Library/Preferences/MobileMeAccounts.plist")],
+        capture_output=True, text=True, check=False)
+    dsid = r.stdout.strip()
+    if r.returncode == 0 and dsid and dsid.lower() != "does not exist":
+        subprocess.run(["defaults", "write",
+                        "com.apple.CloudSubscriptionFeatures.optIn",
+                        dsid, "-bool", "false"], check=False)
+
+
+def summarize_rm_errors(stderr: str) -> str:
+    """Collapse `rm -rf` spam into counts. Directory-not-empty is a follow-on
+    of the real errors, so it is counted but not treated as the cause."""
+    kinds: dict[str, int] = {}
+    for ln in stderr.splitlines():
+        if "Read-only file system" in ln:
+            key = "read-only file system"
+        elif "Resource busy" in ln:
+            key = "resource busy"
+        elif "Operation not permitted" in ln:
+            key = "not permitted"
+        elif "Permission denied" in ln:
+            key = "permission denied"
+        elif "Directory not empty" in ln:
+            key = "directory not empty"
+        elif ln.strip():
+            key = "other"
+        else:
+            continue
+        kinds[key] = kinds.get(key, 0) + 1
+    if not kinds:
+        return "rm failed"
+    return ", ".join(f"{k} ×{n}" for k, n in sorted(kinds.items(),
+                                                     key=lambda kv: -kv[1]))
+
+
+def data_volume_path(path: Path) -> Path:
+    """Prefer /System/Volumes/Data — rm through the sealed `/` firmlink can EROFS."""
+    data_lib = Path("/System/Volumes/Data/System/Library")
+    sys_lib = Path("/System/Library")
+    try:
+        rel = path.resolve().relative_to(sys_lib)
+    except ValueError:
+        return path
+    candidate = data_lib / rel
+    if candidate.exists() or not path.exists():
+        return candidate
+    return path
+
+
+def data_volume_name() -> str:
+    r = subprocess.run(["diskutil", "info", "-plist", "/System/Volumes/Data"],
+                       capture_output=True, check=False)
+    m = re.search(rb"<key>VolumeName</key>\s*<string>([^<]+)</string>",
+                  r.stdout or b"")
+    if m:
+        return m.group(1).decode()
+    return "Data"
+
+
+def leftover_asset_dirs() -> list[Path]:
+    """`.asset` bundles still present, including empty husks after decrypt."""
+    found: list[Path] = []
+    for p in existing_ai_model_dirs():
+        inner = p / "purpose_auto"
+        if inner.is_dir():
+            found.extend(sorted(inner.glob("*.asset")))
+    return found
+
+
+def leftover_blocker_text(*, sip_on: bool | None, ar_on: bool | None,
+                          fv_on: bool | None = None,
+                          data_vol: str = "Data") -> str:
+    """What the user has to change for leftover EROFS trees to become deletable."""
+    recovery_rm = (
+        f"/Volumes/{data_vol}/System/Library/AssetsV2/"
+        "com_apple_MobileAsset_UAF_FM_GenerativeModels"
+    )
+    if sip_on:
+        return (
+            "SIP is on. Downloaders can still be disabled; rm of restricted "
+            "files cannot. Recovery: `csrutil disable`, reboot, re-run. "
+            "OS-sealed leftover also needs FileVault off, then "
+            "`csrutil authenticated-root disable`."
+        )
+    if ar_on is False:
+        return (
+            "SIP and authenticated-root are off, but files still remain. "
+            "From Recovery Terminal, delete the Data volume tree "
+            f"(not sealed `/`):\n  rm -rf \"{recovery_rm}\""
+        )
+    fv_line = (
+        "FileVault is off (`fdesetup`). "
+        if fv_on is False else
+        ""
+    )
+    return (
+        "SIP off is not the remaining lock. authenticated-root is still "
+        "enabled, so `/` is a sealed snapshot. Leftover .AssetData that "
+        "returns EROFS is the OS-sealed GenerativeModels payload.\n"
+        "\n"
+        f"{fv_line}"
+        "`csrutil authenticated-root disable` fails with "
+        "`FileVault must be disabled` while FileVault is on. Settings.app "
+        "lags and can show Off while FileVault is still on — trust "
+        "`fdesetup status`. On Apple Silicon, diskutil "
+        "`FileVault: No (Encrypted at rest)` is hardware AES, not FileVault, "
+        "and stays even when FileVault is off.\n"
+        "\n"
+        "To unseal `/`:\n"
+        "  0. In macOS, `fdesetup status` must print `FileVault is Off`. "
+        "If On: System Settings → Privacy & Security → FileVault Off, wait "
+        "until decrypt finishes (hours is normal), then confirm fdesetup.\n"
+        "  1. Shut down. Hold the power button → Options → Recovery.\n"
+        "  2. Utilities → Terminal:\n"
+        "       csrutil authenticated-root disable\n"
+        "  3. Restart into macOS, then re-run this command.\n"
+        "  4. Optional, Recovery later to reseal `/`:\n"
+        "       csrutil authenticated-root enable\n"
+        "     FileVault can be turned back on in Settings after that.\n"
+        "\n"
+        "Fallback if step 3 still leftovers, Recovery Terminal "
+        "(Data volume, never `/`):\n"
+        f"       rm -rf \"{recovery_rm}\"\n"
+        "\n"
+        "This tool cannot turn FileVault or authenticated-root off "
+        "(Settings / Recovery) and will not write sealed /System executables."
+    )
+
+
+def leftover_model_report() -> int:
+    """Print remaining trees. Return leftover bytes, or 1 if only empty husks."""
+    dirs = existing_ai_model_dirs()
+    leftover = sum(path_size_bytes(p) for p in dirs)
+    husks = leftover_asset_dirs()
+    print(f"models on disk now: {fmt_bytes(leftover)}")
+    if leftover == 0 and not husks:
+        return 0
+    if leftover == 0:
+        print(f"model files are gone; {len(husks)} empty .asset directories remain")
+        for a in husks[:12]:
+            print(f"    {a.name}")
+        extra = len(husks) - 12
+        if extra > 0:
+            print(f"    … {extra} more")
+        print("re-run this command to delete the empty directories. Recovery "
+              "`authenticated-root disable` is only needed if that rm still "
+              "returns EROFS.")
+        return 1
+    print("still on disk:")
+    for p in dirs:
+        print(f"  {fmt_bytes(path_size_bytes(p))}  {p}")
+        inner = p / "purpose_auto"
+        assets = []
+        if inner.is_dir():
+            assets = sorted(inner.glob("*.asset"),
+                            key=path_size_bytes, reverse=True)
+        for a in assets[:12]:
+            print(f"    {fmt_bytes(path_size_bytes(a))}  {a.name}")
+        extra = len(assets) - 12
+        if extra > 0:
+            print(f"    … {extra} more .asset bundles")
+    print(leftover_blocker_text(sip_on=sip_enabled(),
+                                ar_on=authenticated_root_enabled(),
+                                fv_on=filevault_enabled(),
+                                data_vol=data_volume_name()))
+    return leftover
+
+
+def sudo_rm_tree(path: Path) -> tuple[bool, str]:
+    """Clear SIP restricted flags when SIP is off, then rm -rf via the Data volume."""
+    target = data_volume_path(path)
+    subprocess.run(["sudo", "chflags", "-R", "norestricted,nouchg,noschg",
+                    str(target)], capture_output=True, check=False)
+    apfs_util = ("/System/Library/Filesystems/apfs.fs/Contents/Resources/"
+                 "apfs.util")
+    if Path(apfs_util).exists():
+        subprocess.run(["sudo", apfs_util, "-z", str(target)],
+                       capture_output=True, check=False)
+    r = subprocess.run(["sudo", "rm", "-rf", "--", str(target)],
+                       capture_output=True, text=True, check=False)
+    if r.returncode == 0:
+        return True, ""
+    return False, summarize_rm_errors(r.stderr or r.stdout)
+
+
+def cmd_purge_ai_models(sections: list[Section], dry_run: bool,
+                        assume_yes: bool) -> int:
+    """Stop AI model downloads; with SIP off, delete the on-disk trees too.
+
+    Disables mobileassetd for the delete — otherwise nsurlsessiond keeps
+    .AssetData open (EROFS / resource busy) and leftover GB stay. That also
+    stops dictionary/trust-list CDN updates until the TUI row is ticked back
+    on. Does not touch sealed /System executables.
+    """
+    dirs = existing_ai_model_dirs()
+    persist_root = Path("/System/Library/AssetsV2")
+    persist = ai_persist_files(persist_root)
+    total = sum(path_size_bytes(p) for p in dirs)
+    husks = leftover_asset_dirs()
+    sip_on = sip_enabled()
+    ar_on = authenticated_root_enabled()
+    fv_on = filevault_enabled()
+    print(f"Apple Intelligence models on disk: {fmt_bytes(total)}")
+    for p in dirs:
+        print(f"  {fmt_bytes(path_size_bytes(p))}  {p}")
+    if total == 0 and husks:
+        print(f"  {len(husks)} empty .asset directories remain (model files gone)")
+    if persist:
+        print(f"  {len(persist)} AutoAsset scheduler/lock files that would re-queue them")
+    print(f"SIP: {'on' if sip_on else 'off' if sip_on is False else 'unknown'}")
+    print("authenticated-root (sealed /): "
+          f"{'on' if ar_on else 'off' if ar_on is False else 'unknown'}")
+    print(f"FileVault: {'on' if fv_on else 'off' if fv_on is False else 'unknown'}"
+          "  (trust `fdesetup status`; Settings.app lags)")
+    if fv_on:
+        print("`csrutil authenticated-root disable` will fail until FileVault is "
+              "off and `fdesetup status` says Off. Apple Silicon "
+              "'Encrypted at rest' is not FileVault.")
+    if sip_on:
+        print("SIP is on — launchctl disable of the downloaders still runs; "
+              "rm of restricted model files will not. Re-run after "
+              "`csrutil disable` (and a reboot) to reclaim Data downloads.")
+    elif total == 0 and not husks:
+        print("no model trees left on disk.")
+    elif total == 0 and husks:
+        print("model files are gone — this run deletes empty .asset husks. "
+              "Recovery authenticated-root disable is only needed if that rm "
+              "still returns EROFS.")
+    elif sip_on is False and ar_on:
+        print("SIP off is enough for ordinary Data downloads (Visual/"
+              "Overrides). Leftover EROFS .AssetData stays until FileVault "
+              "is off and Recovery: `csrutil authenticated-root disable`. "
+              "This run still tries.")
+    elif sip_on is False:
+        print("SIP is off — will stop mobileassetd, chflags norestricted, "
+              "and delete the trees via the Data volume.")
+
+    wanted = {l for l in AI_DOWNLOAD_LABELS
+              if any(it.label == l for sec in sections for it in sec.items)}
+    refresh_state(sections)
+    for sec in sections:
+        for it in sec.items:
+            if it.label in wanted:
+                it.selected = False
+            else:
+                it.selected = not it.disabled
+
+    if dry_run:
+        print("[dry-run] would disable:", ", ".join(sorted(wanted)) or "(none)")
+        if sip_on is False:
+            print("[dry-run] would delete the model trees and scheduler files")
+        return 0
+
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            print("pass --yes to purge without a prompt", file=sys.stderr)
+            return 1
+        reply = input("Disable AI model downloaders (including mobileassetd)"
+                      + (" and delete the trees" if sip_on is False else "")
+                      + "? [y/N] ").strip().lower()
+        if reply not in ("y", "yes"):
+            print("aborted")
+            return 1
+
+    opt_out_apple_intelligence()
+    print("opted Apple Intelligence off (GMSignedUp / CloudSubscriptionFeatures)")
+    code = run_apply(sections, dry_run=False)
+    for label in (*AI_DOWNLOAD_LABELS, *ANE_BOUT_LABELS):
+        subprocess.run(["sudo", "launchctl", "bootout", f"system/{label}"],
+                       capture_output=True, check=False)
+    if sip_on is not False:
+        leftover_model_report()
+        return code
+
+    time.sleep(1)
+    last_failed = 0
+    persist_root = Path("/System/Library/AssetsV2")
+    for attempt in (1, 2):
+        current = existing_ai_model_dirs()
+        persist = ai_persist_files(persist_root)
+        if not current and not persist:
+            last_failed = 0
+            break
+        if attempt == 2:
+            print("retrying leftover trees...")
+            time.sleep(1)
+        last_failed = 0
+        for p in current:
+            print(f"  deleting {p}...")
+            ok, err = sudo_rm_tree(p)
+            if not ok:
+                print(f"  FAILED  {err}", file=sys.stderr)
+                last_failed += 1
+        for p in persist:
+            ok, err = sudo_rm_tree(p)
+            if not ok:
+                print(f"  FAILED  persist {p.name}: {err}", file=sys.stderr)
+                last_failed += 1
+    leftover = leftover_model_report()
+    if leftover or last_failed:
+        return 1
+    return code
 
 
 def write_snapshot(sections: list[Section]) -> Path:
@@ -1454,6 +1914,8 @@ def cmd_status(sections: list[Section], as_json: bool) -> int:
     spot = spotlight_state()
     free = mem_free_mb()
     stats = catalog_stats()
+    sip_on = sip_enabled()
+    models = sum(path_size_bytes(p) for p in existing_ai_model_dirs())
     if as_json:
         print(json.dumps({
             "catalog": {
@@ -1469,6 +1931,8 @@ def cmd_status(sections: list[Section], as_json: bool) -> int:
             "disabled_but_running": ignored,
             "spotlight": spot,
             "reclaimable_ram_mb": free,
+            "sip_enabled": sip_on,
+            "apple_intelligence_models_bytes": models,
         }, indent=2))
         return 0
     print(f"catalog: {stats.total} labels in {stats.sections} sections "
@@ -1482,6 +1946,26 @@ def cmd_status(sections: list[Section], as_json: bool) -> int:
     print(f"spotlight: {spot}")
     if free is not None:
         print(f"reclaimable RAM now: ~{free} MB")
+    print(f"SIP: {'on' if sip_on else 'off' if sip_on is False else 'unknown'}")
+    ar = authenticated_root_enabled()
+    fv = filevault_enabled()
+    if ar is not None:
+        print("authenticated-root (sealed /System): "
+              f"{'on' if ar else 'off'} — never written by this tool")
+    if fv is not None:
+        print(f"FileVault: {'on' if fv else 'off'}  "
+              "(trust `fdesetup status`; Settings.app lags)")
+    print(f"Apple Intelligence models on disk: {fmt_bytes(models)}")
+    if models and sip_on is False and ar:
+        print("  SIP is off, authenticated-root is on — purge can remove Data "
+              "downloads; EROFS leftover needs FileVault off, then Recovery "
+              "`csrutil authenticated-root disable`")
+    elif models and sip_on is False:
+        print("  SIP is off — `debloat --purge-ai-models` can delete them")
+    elif models and sip_on:
+        print("  SIP is on — disable the MobileAsset/modelcatalog rows to stop "
+              "growth; Data deletes need SIP off, sealed leftover also needs "
+              "authenticated-root off")
     return 0
 
 
@@ -1621,7 +2105,11 @@ Usage:
   debloat --disable-all   disable every label, no exceptions (prompts sudo)
   debloat --enable-all    re-enable everything — the panic button
   debloat --restore       revert to the state before your last apply
-  debloat --dry-run       with --preset/--disable-all/--enable-all: preview only
+  debloat --purge-ai-models  stop AI model downloads (incl. mobileassetd); with
+                             SIP off, delete the AssetsV2 trees. Leftover bytes
+                             are listed, not dumped as thousands of rm lines.
+  debloat --dry-run       with --preset/--disable-all/--enable-all/--purge-ai-models: preview only
+  debloat --yes           with --purge-ai-models: skip the confirmation prompt
   debloat --json          with --status: machine-readable output
   debloat -v|--version    print version
   debloat -h|--help       this help
@@ -1689,6 +2177,8 @@ def main() -> int:
         return cmd_audit(sections, absent, version_skip)
     if "--status" in argv:
         return cmd_status(sections, as_json)
+    if "--purge-ai-models" in argv:
+        return cmd_purge_ai_models(sections, dry_run, "--yes" in argv)
     if "--list" in argv:
         listed = sections
         if preset_name:
@@ -1721,6 +2211,10 @@ def main() -> int:
         return cmd_preset(sections, preset_name, dry_run)
 
     print(source_note)
+    if sip_enabled() is False:
+        print("SIP is off — `debloat --purge-ai-models` can delete Data-only "
+              "Apple Intelligence models; sealed leftover needs FileVault off "
+              "then Recovery `csrutil authenticated-root disable`")
     if absent:
         print(f"skipped {len(absent)} labels not present on this macOS build "
               f"(see `debloat --audit`)")
