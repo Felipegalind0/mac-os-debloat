@@ -521,6 +521,190 @@ def parse_labels(source: Path | str) -> list[Section]:
     return sections
 
 
+@dataclass(frozen=True)
+class CatalogStats:
+    """Sizes of a parsed catalog. Always counted from labels, never a literal."""
+    total: int
+    sections: int
+    telemetry: int
+    balanced: int
+
+    @property
+    def beyond_balanced(self) -> int:
+        return self.total - self.balanced
+
+
+def catalog_stats(sections: list[Section] | None = None) -> CatalogStats:
+    """Count labels and preset sizes from `EMBEDDED_LABELS` (or `sections`).
+
+    This is the only catalog-size API. Help, status, the TUI and docs sync
+    all read it so adding a label cannot leave a stale 270 sitting somewhere.
+    """
+    if sections is None:
+        sections = parse_labels(EMBEDDED_LABELS)
+    total = telemetry = balanced = 0
+    nsec = 0
+    for sec in sections:
+        n = len(sec.items)
+        if not n:
+            continue
+        nsec += 1
+        total += n
+        if sec.preset == "telemetry":
+            telemetry += n
+            balanced += n
+        elif sec.preset == "balanced":
+            balanced += n
+    return CatalogStats(total=total, sections=nsec,
+                        telemetry=telemetry, balanced=balanced)
+
+
+# README / package.json numbers. Titles must match EMBEDDED_LABELS section
+# headers (minus the `[preset]` tag). extras/sync-readme.py rewrites the
+# digits in place from surrounding prose — no HTML markers, so counts stay
+# visible inside backticks and fenced code.
+DOC_COUNT_SECTIONS: dict[str, tuple[str, ...]] = {
+    "siri": ("Siri / voice assistant",),
+    "ai_tahoe": ("Apple Intelligence (Tahoe)",),
+    "more_ai": ("More AI / Apple Intelligence",),
+    "diagnostics_extras": ("Diagnostics extras (all telemetry to Apple)",),
+    "amp": ("Apple Music Player (AMP) suite — no Apple Music",),
+    "music": ("Apple Music / iTunes / Media streaming",),
+    "safari": (
+        "Safari (no Safari use)",
+        "Safari extras (no Safari + no iCloud Keychain)",
+    ),
+    "game": (
+        "Game Center / AirPlay receiver",
+        "Game controllers (no gamepad attached)",
+    ),
+    "family": ("Family / Parental controls (no family setup)",),
+    "beta": ("Beta program enrollment (not on macOS beta)",),
+    "imessage": ("iMessage / FaceTime / phone relay (no iPhone)",),
+    "mail": (
+        "Apple Mail/Calendar/Contacts/Reminders (use Gmail/web instead)",
+        "Contacts / AddressBook (no Mac Contacts use)",
+    ),
+    "continuity": (
+        "AirDrop / Continuity (no iPhone)",
+        "Sidecar / iPad second display (no iPad)",
+        "Continuity Capture (no iPhone webcam)",
+        "AirPlay sender UI",
+        "Continuity Data Protocol (no iPhone)",
+    ),
+    "preset_untouched": (
+        "Apple ID / Apple Pay / SSO",
+        "App Store full kill (re-enable when needed)",
+        "Apple FairPlay DRM (no DRM-protected Apple content)",
+        "T2 / bridgeOS (Apple Silicon doesn't use bridgeOS)",
+        "Apple ID auth (kill — re-enable when needed for App Store)",
+    ),
+}
+
+PKG_COUNT = re.compile(r"(disable )\d+( non-essential)")
+
+# Each pattern must match the README exactly once. Capturing groups are the
+# digits to rewrite; they line up with the count keys. HTML comments are not
+# used — they leak inside backticks and fenced code.
+README_COUNT_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    (r"Interactive console util to disable (\d+) non-essential", ("total",)),
+    (r"Spotlight row and (\d+) launchd services grouped", ("total",)),
+    (r"beta enrollment \((\d+)\)", ("telemetry",)),
+    (r"iMessage, Family \((\d+)\)", ("balanced",)),
+    (r"disabling 137/(\d+) com\.apple", ("total",)),
+    (r"`--preset telemetry` \| (\d+) \|", ("telemetry",)),
+    (r"`--preset balanced` \| (\d+) \|", ("balanced",)),
+    (r"`--disable-all` \| (\d+) \|", ("total",)),
+    (r"bridgeOS — (\d+) labels", ("preset_untouched",)),
+    (r"(\d+) labels sit between", ("beyond_balanced",)),
+    (r"(\d+) labels across (\d+) sections", ("total", "sections")),
+    (r"Siri / voice assistant \((\d+)\)", ("siri",)),
+    (r"Apple Intelligence — Tahoe \((\d+)\)", ("ai_tahoe",)),
+    (r"More AI / Apple Intelligence \((\d+)\)", ("more_ai",)),
+    (r"Diagnostics extras \((\d+)\)", ("diagnostics_extras",)),
+    (r"AMP\) suite \((\d+)\)", ("amp",)),
+    (r"Media streaming \((\d+)\)", ("music",)),
+    (r"Safari \+ Safari extras \((\d+)\)", ("safari",)),
+    (r"Game Center \+ game controllers \((\d+)\)", ("game",)),
+    (r"Family / Parental controls \((\d+)\)", ("family",)),
+    (r"Beta program enrollment \((\d+)\)", ("beta",)),
+    (r"iMessage / FaceTime / phone relay \((\d+)\)", ("imessage",)),
+    (r"Reminders \+ AddressBook \((\d+)\)", ("mail",)),
+    (r"AirPlay / Continuity Capture \((\d+)\)", ("continuity",)),
+    (r"✓ (\d+) labels \+ Spotlight", ("total",)),
+]
+
+
+def doc_counts(sections: list[Section] | None = None) -> dict[str, int]:
+    """Every number `extras/sync-readme.py` writes into README.md / package.json."""
+    if sections is None:
+        sections = parse_labels(EMBEDDED_LABELS)
+    stats = catalog_stats(sections)
+    by_title = {sec.title: len(sec.items) for sec in sections}
+
+    def add(*titles: str) -> int:
+        missing = [t for t in titles if t not in by_title]
+        if missing:
+            raise KeyError("EMBEDDED_LABELS has no section titled "
+                           + ", ".join(repr(t) for t in missing))
+        return sum(by_title[t] for t in titles)
+
+    out = {
+        "total": stats.total,
+        "sections": stats.sections,
+        "telemetry": stats.telemetry,
+        "balanced": stats.balanced,
+        "beyond_balanced": stats.beyond_balanced,
+    }
+    for key, titles in DOC_COUNT_SECTIONS.items():
+        out[key] = add(*titles)
+    return out
+
+
+def apply_readme_counts(text: str, counts: dict[str, int]) -> str:
+    """Rewrite catalog digits in README prose, tables, and code fences."""
+    for pattern, keys in README_COUNT_PATTERNS:
+        def repl(m: re.Match[str], keys=keys) -> str:
+            s = m.group(0)
+            origin = m.start()
+            for i, key in reversed(list(enumerate(keys, start=1))):
+                a, b = m.span(i)
+                s = s[:a - origin] + str(counts[key]) + s[b - origin:]
+            return s
+        text, n = re.subn(pattern, repl, text)
+        if n != 1:
+            raise ValueError(
+                f"README count pattern matched {n} times (want 1): {pattern}")
+    return text
+
+
+def sync_docs(root: Path, *, check: bool = False) -> list[str]:
+    """Rewrite catalog-size digits in README.md and package.json.
+
+    Returns the relative paths that differed. `check=True` writes nothing.
+    """
+    counts = doc_counts()
+    stale: list[str] = []
+    readme = root / "README.md"
+    old_readme = readme.read_text()
+    new_readme = apply_readme_counts(old_readme, counts)
+    if new_readme != old_readme:
+        stale.append("README.md")
+        if not check:
+            readme.write_text(new_readme)
+    pkg = root / "package.json"
+    pkg_text = pkg.read_text()
+    new_pkg, n = PKG_COUNT.subn(rf"\g<1>{counts['total']}\g<2>", pkg_text, count=1)
+    if n != 1:
+        raise ValueError("package.json description has no "
+                         "'disable N non-essential' count to update")
+    if new_pkg != pkg_text:
+        stale.append("package.json")
+        if not check:
+            pkg.write_text(new_pkg)
+    return stale
+
+
 def plist_domains() -> dict[str, set[str]]:
     """label -> launchd domains its job definition lives in. A LaunchAgents
     plist is a `gui/$UID` job, a LaunchDaemons plist a `system` job."""
@@ -918,7 +1102,17 @@ def draw(stdscr, sections: list[Section], cursor: int, status: str, scroll: list
         1 for sec in sections for it in sec.items
         if not it.action and it.selected == it.disabled
     )
-    sub = f"[✓] on   [ ] off   * changes on enter   pending: {diff_count}"
+    stats = catalog_stats()
+    present = sum(
+        1 for sec in sections for it in sec.items
+        if not it.action and sec.title not in (MENU_SECTION, SPOTLIGHT_SECTION)
+    )
+    if present == stats.total:
+        where = f"{present} labels"
+    else:
+        where = f"{present}/{stats.total} on this Mac"
+    sub = (f"[✓] on   [ ] off   * changes on enter   pending: {diff_count}   "
+           f"{where}")
     stdscr.addnstr(1, 0, sub[:w - 1], w - 1, curses.A_DIM)
 
     rows, item_to_row = build_display_rows(sections)
@@ -1173,8 +1367,15 @@ def cmd_status(sections: list[Section], as_json: bool) -> int:
                      if it.disabled and it.label in running)
     spot = spotlight_state()
     free = mem_free_mb()
+    stats = catalog_stats()
     if as_json:
         print(json.dumps({
+            "catalog": {
+                "total": stats.total,
+                "sections": stats.sections,
+                "telemetry": stats.telemetry,
+                "balanced": stats.balanced,
+            },
             "labels_present": total,
             "disabled": disabled,
             "enabled": total - disabled,
@@ -1184,6 +1385,8 @@ def cmd_status(sections: list[Section], as_json: bool) -> int:
             "reclaimable_ram_mb": free,
         }, indent=2))
         return 0
+    print(f"catalog: {stats.total} labels in {stats.sections} sections "
+          f"(telemetry {stats.telemetry}, balanced {stats.balanced})")
     print(f"labels present on this macOS: {total}")
     print(f"  disabled: {disabled}   enabled: {total - disabled}")
     print(f"  running now: {len(running)}")
@@ -1197,7 +1400,9 @@ def cmd_status(sections: list[Section], as_json: bool) -> int:
 
 
 def cmd_audit(sections: list[Section], absent: list[str]) -> int:
+    stats = catalog_stats()
     present = sum(len(sec.items) for sec in sections)
+    print(f"catalog: {stats.total} labels in {stats.sections} sections")
     print(f"{present} labels present on this macOS build.")
     if absent:
         print(f"\n{len(absent)} embedded labels NOT present on this build (skipped):")
@@ -1232,7 +1437,9 @@ def cmd_restore(sections: list[Section]) -> int:
 
 def load_sections() -> tuple[list[Section], str, list[str]]:
     sections = parse_labels(EMBEDDED_LABELS)
-    note = f"{sum(len(s.items) for s in sections)} embedded labels"
+    stats = catalog_stats(sections)
+    note = (f"{stats.total} embedded labels in {stats.sections} sections "
+            f"(telemetry {stats.telemetry}, balanced {stats.balanced})")
     if USER_LABELS_FILE.exists():
         known = {it.label for sec in sections for it in sec.items}
         added = 0
@@ -1301,9 +1508,14 @@ def cmd_preset(sections: list[Section], name: str, dry_run: bool) -> int:
 
 VERSION = "0.11.0"
 
-HELP = f"""mac-os-debloat {VERSION} — toggle non-essential macOS launchd services and the Spotlight index.
+
+def help_text() -> str:
+    stats = catalog_stats()
+    return f"""mac-os-debloat {VERSION} — toggle non-essential macOS launchd services and the Spotlight index.
 
 Runs a live SIP-safe launchctl TUI by default (no SIP disable required).
+
+Catalog: {stats.total} labels in {stats.sections} sections.
 
 Usage:
   debloat                 interactive TUI (default)
@@ -1320,18 +1532,19 @@ Usage:
   debloat -h|--help       this help
 
 Presets:
-  telemetry   analytics, crash reports, Apple ads, Biome, beta enrollment
-  balanced    telemetry + Siri, Apple Intelligence, iMessage/Continuity, Family
+  telemetry   {stats.telemetry} labels — analytics, crash reports, Apple ads, Biome, beta enrollment
+  balanced    {stats.balanced} labels — telemetry + Siri, Apple Intelligence, iMessage/Continuity, Family
+  disable-all {stats.total} labels — every catalog entry, including Apple ID auth, App Store, bridgeOS
   custom      {PRESETS_DIR}/NAME.txt
 
   The TUI lists telemetry, balanced, disable all and enable all as menu rows
   above the checkboxes — arrow onto one and press enter to apply it.
 
   A preset only disables its own labels; everything else is left as-is, and
-  nothing is ever re-enabled. Counts are before pruning labels absent from
-  your macOS build. --disable-all and --enable-all ignore --preset and take
-  every label, including Apple ID auth, App Store and bridgeOS — that breaks
-  iCloud login, App Store purchases and macOS Update installs.
+  nothing is ever re-enabled. Counts above are before pruning labels absent
+  from your macOS build. --disable-all and --enable-all ignore --preset and
+  take every label, including Apple ID auth, App Store and bridgeOS — that
+  breaks iCloud login, App Store purchases and macOS Update installs.
 
 Your own labels:
   {USER_LABELS_FILE} is appended to the built-in list.
@@ -1347,7 +1560,7 @@ Make your own preset:
 def main() -> int:
     argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv:
-        print(HELP)
+        print(help_text())
         return 0
     if "-v" in argv or "--version" in argv:
         print(f"mac-os-debloat {VERSION}")
