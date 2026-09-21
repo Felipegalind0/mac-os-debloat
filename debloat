@@ -228,14 +228,15 @@ com.apple.synapse.contentlinkingd             # Notes / Safari content links (ba
 com.apple.LinkedNotesUIService                # Notes backlink indicator UI (~26 MB)
 
 # === Spotlight KeepAlive daemons (mdutil -d leaves these resident) [macos>=27] ===
-# Not in telemetry/balanced: on Tahoe 26, launchctl on corespotlightd broke
-# typed Cmd-Space. On Golden Gate 27, app launch uses Launch Services without
-# these, and mds KeepAlive is real RAM after the Spotlight row is off.
+# Not in telemetry/balanced. On Tahoe 26, launchctl on corespotlightd broke
+# typed Cmd-Space. These rows are indexer KeepAlive after mdutil -d, not the
+# overlay: on 27 Cmd-Space / the four-finger Apps pinch is com.apple.campo
+# (Siri AI.app). Do not list com.apple.Spotlight here — that is the old
+# overlay host, already feature-flagged off when campo is the UI.
 com.apple.metadata.mds                        # Spotlight server (KeepAlive)
 com.apple.metadata.mds.index                  # Spotlight index helper
 com.apple.metadata.mds.scan                   # Spotlight scan helper
 com.apple.msrpc.mdssvc                        # Spotlight SMB/network metadata
-com.apple.Spotlight                           # Spotlight.app LaunchAgent
 com.apple.corespotlightd                      # CoreSpotlight daemon
 com.apple.corespotlightservice                # CoreSpotlight service
 com.apple.managedcorespotlightd               # managed CoreSpotlight

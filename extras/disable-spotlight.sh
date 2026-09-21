@@ -6,8 +6,8 @@
 # only). Reversing the KeepAlive cut is the TUI / --restore / --enable-all.
 #
 # Loss: Cmd-Space *file* search, Finder Cmd-F, Mail content search.
-# Keep: Cmd-Space still launches apps by name (Launch Services). Empty
-# Spotlight is blank; use a Dock Applications stack for an icon grid.
+# Keep: the Cmd-Space overlay (on 27 that is com.apple.campo, not mds).
+# Empty Spotlight is blank; use a Dock Applications stack for an icon grid.
 # CLI find / fd / rg are unaffected.
 set -e
 

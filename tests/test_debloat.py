@@ -741,7 +741,8 @@ com.apple.metadata.mds                        # server
         self.assertIn("com.apple.metadata.mds", ka)
         self.assertIn("com.apple.corespotlightd", ka)
         self.assertNotIn("com.apple.callintelligenced", ka)
-        self.assertEqual(len(ka), 11)
+        self.assertEqual(len(ka), 10)
+        self.assertNotIn("com.apple.Spotlight", ka)
         speech = [it.label for s in secs if "Speech" in s.title for it in s.items]
         self.assertIn("com.apple.speech.speechsynthesisd.arm64", speech)
         self.assertIn("com.apple.speech.speechsynthesisd.x86_64", speech)
