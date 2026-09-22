@@ -441,7 +441,7 @@ com.apple.wifianalyticsd                      # WiFi telemetry
 
 # === T2 / bridgeOS ===
 # Same labels on T2 Intel and Apple Silicon. Disabling them breaks the
-# macOS Update install step on both (upstream issue #7). Not in balanced.
+# macOS Update install step on both. Not in balanced.
 com.apple.bridgeOSUpdateProxy                 # firmware/update proxy (T2 and Apple Silicon)
 com.apple.bosreporter                         # bridgeOS install reporting
 com.apple.boswatcher                          # BoardOS accessory watcher
@@ -500,6 +500,9 @@ com.apple.replicatord                         # Time Machine replicator (alt lab
 """
 
 USER_LABELS_FILE = BACKUP_DIR / "labels.txt"
+# Embedded + USER_LABELS_FILE, counted by load_sections before the version and
+# absent-label drops remove rows. The TUI header cannot recount it afterwards.
+CATALOG_TOTAL = 0
 PRESETS_DIR = BACKUP_DIR / "presets"
 
 BUILTIN_PRESETS = {
@@ -1188,15 +1191,14 @@ def draw(stdscr, sections: list[Section], cursor: int, status: str, scroll: list
         1 for sec in sections for it in sec.items
         if not it.action and it.selected == it.disabled
     )
-    stats = catalog_stats()
     present = sum(
         1 for sec in sections for it in sec.items
         if not it.action and sec.title not in (MENU_SECTION, SPOTLIGHT_SECTION)
     )
-    if present == stats.total:
+    if present == CATALOG_TOTAL:
         where = f"{present} labels"
     else:
-        where = f"{present}/{stats.total} on this Mac"
+        where = f"{present}/{CATALOG_TOTAL} on this Mac"
     sub = (f"[✓] on   [ ] off   * changes on enter   pending: {diff_count}   "
            f"{where}")
     stdscr.addnstr(1, 0, sub[:w - 1], w - 1, curses.A_DIM)
@@ -1549,6 +1551,8 @@ def load_sections() -> tuple[list[Section], str, list[str], list[str]]:
                 sections.append(sec)
                 added += len(sec.items)
         note += f" + {added} from {USER_LABELS_FILE}"
+    global CATALOG_TOTAL
+    CATALOG_TOTAL = sum(len(sec.items) for sec in sections)
     version_skip = drop_wrong_macos(sections)
     absent = drop_absent_labels(sections)
     return sections, note, absent, version_skip
